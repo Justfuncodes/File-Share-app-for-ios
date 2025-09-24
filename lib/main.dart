@@ -62,6 +62,8 @@ class _MainPageState extends State<MainPage> {
   TransferState _currentState = TransferState.idle;
   String _statusText = "Initializing...";
   String _localIp = "Getting IP...";
+  double _progress = 0.0;
+  String _speedText = "";
   ServerSocket? _serverSocket;
 
   @override
@@ -94,6 +96,8 @@ class _MainPageState extends State<MainPage> {
     setState(() {
       _currentState = TransferState.transferring;
       _statusText = status;
+      _progress = 0.0;
+      _speedText = "";
     });
   }
 
@@ -102,17 +106,14 @@ class _MainPageState extends State<MainPage> {
       _currentState = TransferState.success;
       _statusText = message;
     });
-    await Future.delayed(const Duration(seconds: 3));
+    await Future.delayed(const Duration(seconds: 4));
     if (mounted) await _setIdleUI();
   }
 
   Future<void> _pickMedia() async {
     final List<AssetEntity>? result = await AssetPicker.pickAssets(
       context,
-      pickerConfig: const AssetPickerConfig(
-        maxAssets: 100,
-        requestType: RequestType.common,
-      ),
+      pickerConfig: const AssetPickerConfig(maxAssets: 100, requestType: RequestType.common),
     );
     if (result == null || result.isEmpty) return;
 
@@ -121,15 +122,10 @@ class _MainPageState extends State<MainPage> {
       final file = await asset.originFile;
       if (file != null) {
         files.add(PlatformFile(
-          name: asset.title ?? 'unknown_media',
-          path: file.path,
-          size: await file.length(),
-        ));
+            name: asset.title ?? 'unknown_media', path: file.path, size: await file.length()));
       }
     }
-    if (files.isNotEmpty) {
-      await _startSending(files);
-    }
+    if (files.isNotEmpty) await _startSending(files);
   }
 
   Future<void> _pickFiles() async {
@@ -150,8 +146,7 @@ class _MainPageState extends State<MainPage> {
         break;
       }
     } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Send Error: ${e.toString()}")));
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Send Error: ${e.toString()}")));
       await _setIdleUI();
     } finally {
       await _serverSocket?.close();
@@ -165,11 +160,10 @@ class _MainPageState extends State<MainPage> {
       var subscription = client.listen((data) {
         if (!completer.isCompleted) completer.complete(data);
       });
-      final receivedData = await completer.future.timeout(const Duration(seconds: 15));
+      final receivedData = await completer.future.timeout(const Duration(seconds: 20));
       subscription.cancel();
-      
-      final receivedCode = receivedData.buffer.asByteData().getInt32(0);
-      if (receivedCode != securityCode) throw Exception("Wrong security code.");
+
+      if (receivedData.buffer.asByteData().getInt32(0) != securityCode) throw Exception("Wrong security code.");
 
       client.add(Uint8List(4)..buffer.asByteData().setInt32(0, files.length));
       await client.flush();
@@ -191,8 +185,7 @@ class _MainPageState extends State<MainPage> {
       }
       await _showSuccessState("Transfer Complete!");
     } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Handle client error: ${e.toString()}")));
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Connection Error: ${e.toString()}")));
       await _setIdleUI();
     } finally {
       client.close();
@@ -206,13 +199,15 @@ class _MainPageState extends State<MainPage> {
 
       final destinationDir = await getApplicationDocumentsDirectory();
       final parts = result.split(':');
+      if (parts.length != 2) throw const FormatException("Invalid format. Use IP:Code");
+      
       final ip = parts[0];
       final code = int.tryParse(parts[1]);
       if (code == null) throw const FormatException("Invalid code.");
 
       _setTransferUI("Connecting to $ip...");
       await _startReceiver(ip, code, destinationDir.path);
-      await _showSuccessState("All files saved!");
+      await _showSuccessState("All files saved to Files app!");
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Receive Error: ${e.toString()}")));
@@ -224,30 +219,32 @@ class _MainPageState extends State<MainPage> {
   Future<void> _startReceiver(String ip, int code, String destinationFolder) async {
     Socket? socket;
     try {
-      socket = await Socket.connect(ip, port, timeout: const Duration(seconds: 10));
+      socket = await Socket.connect(ip, port, timeout: const Duration(seconds: 15));
       socket.add(Uint8List(4)..buffer.asByteData().setInt32(0, code));
       await socket.flush();
 
-      var buffer = <int>[];
-      var completer = Completer<void>();
-      var subscription = socket.listen(
-        (data) {
-          buffer.addAll(data);
-          if (!completer.isCompleted) completer.complete();
-        },
-        onDone: () {
-          if (!completer.isCompleted) completer.complete();
-        }
-      );
-
+      var dataStream = socket.asBroadcastStream();
+      
       Future<Uint8List> readBytes(int count) async {
-        while (buffer.length < count) {
-          completer = Completer<void>();
-          await completer.future.timeout(const Duration(seconds: 30));
-        }
-        var result = Uint8List.fromList(buffer.sublist(0, count));
-        buffer.removeRange(0, count);
-        return result;
+        final completer = Completer<Uint8List>();
+        final buffer = BytesBuilder();
+        late StreamSubscription subscription;
+        subscription = dataStream.listen(
+          (data) {
+            buffer.add(data);
+            if (buffer.length >= count) {
+              subscription.cancel();
+              completer.complete(Uint8List.fromList(buffer.toBytes().sublist(0, count)));
+            }
+          },
+          onDone: () {
+            if (!completer.isCompleted) completer.completeError("Socket closed prematurely.");
+          },
+          onError: (e) {
+             if (!completer.isCompleted) completer.completeError(e);
+          }
+        );
+        return await completer.future.timeout(const Duration(seconds: 30));
       }
 
       final fileCountBytes = await readBytes(4);
@@ -259,25 +256,57 @@ class _MainPageState extends State<MainPage> {
         final fileNameBytes = await readBytes(fileNameLen);
         final fileName = String.fromCharCodes(fileNameBytes);
         
-        if (mounted) setState(() => _statusText = "Receiving ${i + 1}/$fileCount:\n$fileName");
-
         final fileSizebytes = await readBytes(8);
         final fileSize = fileSizebytes.buffer.asByteData().getInt64(0);
 
+        if (mounted) {
+          setState(() {
+            _statusText = "Receiving ${i + 1}/$fileCount:\n$fileName";
+            _progress = 0;
+            _speedText = "0 MB/s";
+          });
+        }
+        
         final outputFile = File(path.join(destinationFolder, fileName));
         var sink = outputFile.openWrite();
+        
         int receivedSize = 0;
+        var stopwatch = Stopwatch()..start();
+        
+        final completer = Completer<void>();
+        late StreamSubscription subscription;
+        subscription = dataStream.listen(
+          (data) {
+            sink.add(data);
+            receivedSize += data.length;
+            
+            if (stopwatch.elapsedMilliseconds > 500) {
+              final speed = receivedSize / (stopwatch.elapsedMilliseconds / 1000.0) / 1024 / 1024;
+              if (mounted) {
+                setState(() {
+                  _progress = receivedSize / fileSize;
+                  _speedText = "${speed.toStringAsFixed(2)} MB/s";
+                });
+              }
+            }
 
-        while (receivedSize < fileSize) {
-            completer = Completer<void>();
-            final chunk = await readBytes(min(fileSize - receivedSize, 65536));
-            sink.add(chunk);
-            receivedSize += chunk.length;
-        }
+            if (receivedSize >= fileSize) {
+              subscription.cancel();
+              completer.complete();
+            }
+          },
+          onDone: () {
+             if (!completer.isCompleted) completer.completeError("Socket closed before file was complete.");
+          },
+          onError: (e) {
+             if (!completer.isCompleted) completer.completeError(e);
+          }
+        );
+
+        await completer.future.timeout(const Duration(minutes: 30));
         await sink.flush();
         await sink.close();
       }
-      subscription.cancel();
     } finally {
       socket?.destroy();
     }
@@ -291,23 +320,20 @@ class _MainPageState extends State<MainPage> {
       builder: (context) => AlertDialog(
         backgroundColor: Colors.white,
         title: const Text("Connect to Sender", style: TextStyle(color: Colors.black)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: ipController,
-              autofocus: true,
-              decoration: const InputDecoration(labelText: "Sender's IP"),
-              style: const TextStyle(color: Colors.black),
-            ),
-            TextField(
-              controller: codeController,
-              decoration: const InputDecoration(labelText: "CODE"),
-              keyboardType: TextInputType.number,
-              style: const TextStyle(color: Colors.black),
-            ),
-          ],
-        ),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(
+            controller: ipController,
+            autofocus: true,
+            decoration: const InputDecoration(labelText: "Sender's IP"),
+            style: const TextStyle(color: Colors.black),
+          ),
+          TextField(
+            controller: codeController,
+            decoration: const InputDecoration(labelText: "CODE"),
+            keyboardType: TextInputType.number,
+            style: const TextStyle(color: Colors.black),
+          ),
+        ]),
         actions: [
           TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text("Cancel")),
           TextButton(onPressed: () => Navigator.of(context).pop("${ipController.text}:${codeController.text}"), child: const Text("Connect")),
@@ -339,10 +365,7 @@ class _MainPageState extends State<MainPage> {
                   borderRadius: BorderRadius.circular(16),
                   boxShadow: const [BoxShadow(color: Colors.black38, offset: Offset(5, 5), blurRadius: 10)],
                 ),
-                child: AnimatedSwitcher(
-                  duration: const Duration(milliseconds: 300),
-                  child: _buildContent(),
-                ),
+                child: _buildContent(),
               ),
             ],
           ),
@@ -351,43 +374,34 @@ class _MainPageState extends State<MainPage> {
     );
   }
 
+  // --- THIS IS THE MISSING METHOD ---
   Widget _buildContent() {
     final textStyle = const TextStyle(color: Colors.black, fontSize: 18, fontWeight: FontWeight.w600);
     switch (_currentState) {
       case TransferState.idle:
-        return Column(
-          key: const ValueKey('idle'),
-          children: [
-            Text(_statusText, style: textStyle, textAlign: TextAlign.center),
-            const SizedBox(height: 20),
-            ElevatedButton(onPressed: _pickMedia, child: const Text("Select Photos & Videos")),
-            const SizedBox(height: 10),
-            ElevatedButton(onPressed: _pickFiles, child: const Text("Select Other Files")),
-            const SizedBox(height: 10),
-            ElevatedButton(onPressed: _receiveButton_Clicked, style: ElevatedButton.styleFrom(backgroundColor: Colors.grey[700]), child: const Text("Receive", style: TextStyle(color: Colors.white))),
-          ],
-        );
+        return Column(key: const ValueKey('idle'), children: [
+          Text(_statusText, style: textStyle, textAlign: TextAlign.center),
+          const SizedBox(height: 20),
+          ElevatedButton(onPressed: _pickMedia, child: const Text("Select Photos & Videos")),
+          const SizedBox(height: 10),
+          ElevatedButton(onPressed: _pickFiles, child: const Text("Select Other Files")),
+          const SizedBox(height: 10),
+          ElevatedButton(onPressed: _receiveButton_Clicked, style: ElevatedButton.styleFrom(backgroundColor: Colors.grey[700]), child: const Text("Receive", style: TextStyle(color: Colors.white))),
+        ]);
       case TransferState.transferring:
-        return Column(
-          key: const ValueKey('transferring'),
-          children: [
-            Text(_statusText, style: textStyle.copyWith(fontSize: 16), textAlign: TextAlign.center),
-            const SizedBox(height: 20),
-            const CircularProgressIndicator(),
-          ],
-        );
+        return Column(key: const ValueKey('transferring'), children: [
+          Text(_statusText, style: textStyle.copyWith(fontSize: 16), textAlign: TextAlign.center),
+          const SizedBox(height: 20),
+          LinearProgressIndicator(value: _progress),
+          const SizedBox(height: 8),
+          Text(_speedText, style: const TextStyle(color: Colors.black, fontSize: 20, fontWeight: FontWeight.w600)),
+        ]);
       case TransferState.success:
-        return Column(
-          key: const ValueKey('success'),
-          children: [
-            SizedBox(
-              height: 120,
-              child: Lottie.asset('assets/transfer_complete.json', repeat: false),
-            ),
-            const SizedBox(height: 10),
-            Text(_statusText, style: textStyle, textAlign: TextAlign.center),
-          ],
-        );
+        return Column(key: const ValueKey('success'), children: [
+          SizedBox(height: 120, child: Lottie.asset('assets/transfer_complete.json', repeat: false)),
+          const SizedBox(height: 10),
+          Text(_statusText, style: textStyle, textAlign: TextAlign.center),
+        ]);
     }
   }
 }
