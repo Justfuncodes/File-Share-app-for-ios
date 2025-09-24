@@ -7,13 +7,18 @@
 	<key>CFBundleDisplayName</key>
 	<string>FILE SHARE</string>
 	<key>NSPhotoLibraryUsageDescription</key>
-<string>This app needs access to your photo library to send photos and videos.</string>
-<key>NSLocalNetworkUsageDescription</key>
-<string>This app uses the local network to find and connect to other devices for file transfer.</string>
-<key>UISupportsDocumentBrowser</key>
-<true/>
-<key>LSSupportsOpeningDocumentsInPlace</key>
-<true/>
+    <string>This app needs access to your photo library to send photos and videos.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>This app uses the local network to find and connect to other devices for file transfer.</string>
+    <key>UISupportsDocumentBrowser</key>
+    <true/>
+    <key>LSSupportsOpeningDocumentsInPlace</key>
+    <true/>
+	<!-- Add these two keys to enable file sharing -->
+    <key>UIFileSharingEnabled</key>
+    <true/>
+    <key>LSSupportsOpeningDocumentsInPlace</key>
+    <true/>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>

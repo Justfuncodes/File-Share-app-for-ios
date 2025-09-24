@@ -12,7 +12,6 @@ import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:wechat_assets_picker/wechat_assets_picker.dart';
 
-// Constants
 const int port = 12345;
 
 void main() {
@@ -62,10 +61,7 @@ enum TransferState { idle, transferring, success }
 class _MainPageState extends State<MainPage> {
   TransferState _currentState = TransferState.idle;
   String _statusText = "Initializing...";
-  double _progress = 0.0;
-  String _speedText = "";
   String _localIp = "Getting IP...";
-  List<PlatformFile> _filesToSend = [];
   ServerSocket? _serverSocket;
 
   @override
@@ -80,10 +76,8 @@ class _MainPageState extends State<MainPage> {
     super.dispose();
   }
 
-  // --- UI State Management ---
   Future<void> _setIdleUI() async {
     await [Permission.photos, Permission.storage].request();
-    _filesToSend.clear();
     try {
       _localIp = await NetworkInfo().getWifiIP() ?? "No Wi-Fi IP";
     } catch (e) {
@@ -100,8 +94,6 @@ class _MainPageState extends State<MainPage> {
     setState(() {
       _currentState = TransferState.transferring;
       _statusText = status;
-      _progress = 0.0;
-      _speedText = "";
     });
   }
 
@@ -114,123 +106,119 @@ class _MainPageState extends State<MainPage> {
     if (mounted) await _setIdleUI();
   }
 
-  // --- Networking Logic (Sender) ---
-  // --- REPLACE the old _sendButton_Clicked function ---
-Future<void> _sendButton_Clicked() async {
-  final List<AssetEntity>? result = await AssetPicker.pickAssets(
-    context,
-    pickerConfig: const AssetPickerConfig(
-      maxAssets: 100, // Allow up to 100 files at once
-      requestType: RequestType.common, // Show photos, videos, and other files
-    ),
-  );
-
-  if (result == null || result.isEmpty) return;
-
-  _filesToSend.clear();
-  for (var asset in result) {
-    final file = await asset.originFile;
-    if (file != null) {
-      _filesToSend.add(PlatformFile(
-        name: asset.title ?? 'unknown',
-        path: file.path,
-        size: await file.length(),
-      ));
-    }
-  }
-  
-  if (_filesToSend.isEmpty) return;
-
-  _setTransferUI("${_filesToSend.length} file(s) ready to send.");
-  
-  try {
-    final securityCode = Random().nextInt(899999) + 100000;
-    _serverSocket = await ServerSocket.bind(InternetAddress.anyIPv4, port);
-    _setTransferUI("On the other device, enter:\nIP: $_localIp\nCode: $securityCode");
-    
-    await for (var clientSocket in _serverSocket!) {
-      await _handleClient(clientSocket, _filesToSend, securityCode);
-      break;
-    }
-  } catch (e) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Send Error: ${e.toString()}")));
-    await _setIdleUI();
-  } finally {
-    await _serverSocket?.close();
-    _serverSocket = null;
-  }
-}
-
-
-  // --- REPLACE THE OLD _handleClient with this NEW version ---
-// --- REPLACE the old _handleClient function ---
-Future<void> _handleClient(Socket client, List<PlatformFile> files, int securityCode) async {
-  try {
-    var completer = Completer<Uint8List>();
-    var subscription = client.listen(
-      (data) {
-        if (!completer.isCompleted) completer.complete(data);
-      }
+  Future<void> _pickMedia() async {
+    final List<AssetEntity>? result = await AssetPicker.pickAssets(
+      context,
+      pickerConfig: const AssetPickerConfig(
+        maxAssets: 100,
+        requestType: RequestType.common,
+      ),
     );
-    
-    final receivedData = await completer.future;
-    subscription.cancel();
-    final receivedCode = receivedData.buffer.asByteData().getInt32(0);
-    if (receivedCode != securityCode) throw Exception("Wrong security code.");
+    if (result == null || result.isEmpty) return;
 
-    client.add(Uint8List(4)..buffer.asByteData().setInt32(0, files.length));
-    await client.flush(); // Flush after sending file count
-
-    for (int i = 0; i < files.length; i++) {
-      final file = files[i];
-      if (mounted) setState(() => _statusText = "Sending ${i + 1}/${files.length}:\n${file.name}");
-
-      final fileNameBytes = file.name.codeUnits;
-      client.add(Uint8List(2)..buffer.asByteData().setInt16(0, fileNameBytes.length));
-      await client.flush(); // Flush
-      client.add(fileNameBytes);
-      await client.flush(); // Flush
-      client.add(Uint8List(8)..buffer.asByteData().setInt64(0, file.size));
-      await client.flush(); // Flush
-
-      final fileStream = File(file.path!).openRead();
-      await client.addStream(fileStream); // addStream handles its own flushing
+    List<PlatformFile> files = [];
+    for (var asset in result) {
+      final file = await asset.originFile;
+      if (file != null) {
+        files.add(PlatformFile(
+          name: asset.title ?? 'unknown_media',
+          path: file.path,
+          size: await file.length(),
+        ));
+      }
     }
-    await _showSuccessState("Transfer Complete!");
-  } catch (e) {
+    if (files.isNotEmpty) {
+      await _startSending(files);
+    }
+  }
+
+  Future<void> _pickFiles() async {
+    final result = await FilePicker.platform.pickFiles(allowMultiple: true);
+    if (result == null || result.files.isEmpty) return;
+    await _startSending(result.files);
+  }
+
+  Future<void> _startSending(List<PlatformFile> files) async {
+    _setTransferUI("${files.length} file(s) ready to send.");
+    try {
+      final securityCode = Random().nextInt(899999) + 100000;
+      _serverSocket = await ServerSocket.bind(InternetAddress.anyIPv4, port);
+      _setTransferUI("On the other device, enter:\nIP: $_localIp\nCode: $securityCode");
+      
+      await for (var clientSocket in _serverSocket!) {
+        await _handleClient(clientSocket, files, securityCode);
+        break;
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Send Error: ${e.toString()}")));
+      await _setIdleUI();
+    } finally {
+      await _serverSocket?.close();
+      _serverSocket = null;
+    }
+  }
+
+  Future<void> _handleClient(Socket client, List<PlatformFile> files, int securityCode) async {
+    try {
+      var completer = Completer<Uint8List>();
+      var subscription = client.listen((data) {
+        if (!completer.isCompleted) completer.complete(data);
+      });
+      final receivedData = await completer.future.timeout(const Duration(seconds: 15));
+      subscription.cancel();
+      
+      final receivedCode = receivedData.buffer.asByteData().getInt32(0);
+      if (receivedCode != securityCode) throw Exception("Wrong security code.");
+
+      client.add(Uint8List(4)..buffer.asByteData().setInt32(0, files.length));
+      await client.flush();
+
+      for (int i = 0; i < files.length; i++) {
+        final file = files[i];
+        if (mounted) setState(() => _statusText = "Sending ${i + 1}/${files.length}:\n${file.name}");
+
+        final fileNameBytes = file.name.codeUnits;
+        client.add(Uint8List(2)..buffer.asByteData().setInt16(0, fileNameBytes.length));
+        await client.flush();
+        client.add(fileNameBytes);
+        await client.flush();
+        client.add(Uint8List(8)..buffer.asByteData().setInt64(0, file.size));
+        await client.flush();
+
+        final fileStream = File(file.path!).openRead();
+        await client.addStream(fileStream);
+      }
+      await _showSuccessState("Transfer Complete!");
+    } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Handle client error: ${e.toString()}")));
       await _setIdleUI();
-  } finally {
+    } finally {
       client.close();
+    }
   }
-}
 
-
-  // --- Networking Logic (Receiver) ---
   Future<void> _receiveButton_Clicked() async {
-    WidgetsBinding.instance.addPostFrameCallback((_) async {
-      try {
-        final String? result = await _showIpCodePrompt();
-        if (result == null || !result.contains(':')) return;
+    try {
+      final String? result = await _showIpCodePrompt();
+      if (result == null || !result.contains(':')) return;
 
-        final destinationDir = await getApplicationDocumentsDirectory();
-        final parts = result.split(':');
-        final ip = parts[0];
-        final code = int.tryParse(parts[1]);
-        if (code == null) throw const FormatException("Invalid code.");
+      final destinationDir = await getApplicationDocumentsDirectory();
+      final parts = result.split(':');
+      final ip = parts[0];
+      final code = int.tryParse(parts[1]);
+      if (code == null) throw const FormatException("Invalid code.");
 
-        _setTransferUI("Connecting to $ip...");
-        await _startReceiver(ip, code, destinationDir.path);
-        await _showSuccessState("All files saved!");
-      } catch (e) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Receive Error: ${e.toString()}")));
-          await _setIdleUI();
-        }
+      _setTransferUI("Connecting to $ip...");
+      await _startReceiver(ip, code, destinationDir.path);
+      await _showSuccessState("All files saved!");
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Receive Error: ${e.toString()}")));
+        await _setIdleUI();
       }
-    });
+    }
   }
 
   Future<void> _startReceiver(String ip, int code, String destinationFolder) async {
@@ -238,6 +226,7 @@ Future<void> _handleClient(Socket client, List<PlatformFile> files, int security
     try {
       socket = await Socket.connect(ip, port, timeout: const Duration(seconds: 10));
       socket.add(Uint8List(4)..buffer.asByteData().setInt32(0, code));
+      await socket.flush();
 
       var buffer = <int>[];
       var completer = Completer<void>();
@@ -254,7 +243,7 @@ Future<void> _handleClient(Socket client, List<PlatformFile> files, int security
       Future<Uint8List> readBytes(int count) async {
         while (buffer.length < count) {
           completer = Completer<void>();
-          await completer.future;
+          await completer.future.timeout(const Duration(seconds: 30));
         }
         var result = Uint8List.fromList(buffer.sublist(0, count));
         buffer.removeRange(0, count);
@@ -269,14 +258,24 @@ Future<void> _handleClient(Socket client, List<PlatformFile> files, int security
         final fileNameLen = fileNameLenBytes.buffer.asByteData().getInt16(0);
         final fileNameBytes = await readBytes(fileNameLen);
         final fileName = String.fromCharCodes(fileNameBytes);
+        
         if (mounted) setState(() => _statusText = "Receiving ${i + 1}/$fileCount:\n$fileName");
 
         final fileSizebytes = await readBytes(8);
         final fileSize = fileSizebytes.buffer.asByteData().getInt64(0);
-        
-        final fileData = await readBytes(fileSize);
+
         final outputFile = File(path.join(destinationFolder, fileName));
-        await outputFile.writeAsBytes(fileData);
+        var sink = outputFile.openWrite();
+        int receivedSize = 0;
+
+        while (receivedSize < fileSize) {
+            completer = Completer<void>();
+            final chunk = await readBytes(min(fileSize - receivedSize, 65536));
+            sink.add(chunk);
+            receivedSize += chunk.length;
+        }
+        await sink.flush();
+        await sink.close();
       }
       subscription.cancel();
     } finally {
@@ -295,8 +294,18 @@ Future<void> _handleClient(Socket client, List<PlatformFile> files, int security
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            TextField(controller: ipController, decoration: const InputDecoration(labelText: "Sender's IP"), style: const TextStyle(color: Colors.black)),
-            TextField(controller: codeController, decoration: const InputDecoration(labelText: "CODE"), keyboardType: TextInputType.number, style: const TextStyle(color: Colors.black)),
+            TextField(
+              controller: ipController,
+              autofocus: true,
+              decoration: const InputDecoration(labelText: "Sender's IP"),
+              style: const TextStyle(color: Colors.black),
+            ),
+            TextField(
+              controller: codeController,
+              decoration: const InputDecoration(labelText: "CODE"),
+              keyboardType: TextInputType.number,
+              style: const TextStyle(color: Colors.black),
+            ),
           ],
         ),
         actions: [
@@ -307,7 +316,6 @@ Future<void> _handleClient(Socket client, List<PlatformFile> files, int security
     );
   }
 
-  // --- UI Build Method ---
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -352,13 +360,11 @@ Future<void> _handleClient(Socket client, List<PlatformFile> files, int security
           children: [
             Text(_statusText, style: textStyle, textAlign: TextAlign.center),
             const SizedBox(height: 20),
-            Row(
-              children: [
-                Expanded(child: ElevatedButton(onPressed: _sendButton_Clicked, child: const Text("Send"))),
-                const SizedBox(width: 10),
-                Expanded(child: ElevatedButton(onPressed: _receiveButton_Clicked, child: const Text("Receive"))),
-              ],
-            ),
+            ElevatedButton(onPressed: _pickMedia, child: const Text("Select Photos & Videos")),
+            const SizedBox(height: 10),
+            ElevatedButton(onPressed: _pickFiles, child: const Text("Select Other Files")),
+            const SizedBox(height: 10),
+            ElevatedButton(onPressed: _receiveButton_Clicked, style: ElevatedButton.styleFrom(backgroundColor: Colors.grey[700]), child: const Text("Receive", style: TextStyle(color: Colors.white))),
           ],
         );
       case TransferState.transferring:
@@ -367,9 +373,7 @@ Future<void> _handleClient(Socket client, List<PlatformFile> files, int security
           children: [
             Text(_statusText, style: textStyle.copyWith(fontSize: 16), textAlign: TextAlign.center),
             const SizedBox(height: 20),
-            LinearProgressIndicator(value: _progress, color: Theme.of(context).colorScheme.primary),
-            const SizedBox(height: 8),
-            Text(_speedText, style: const TextStyle(color: Colors.black, fontSize: 20, fontWeight: FontWeight.w600)),
+            const CircularProgressIndicator(),
           ],
         );
       case TransferState.success:
