@@ -1,6 +1,11 @@
 name: Build Unsigned Flutter iOS App
 
 on:
+  # --- THIS IS THE NEW PART ---
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+  # This part was already here
   push:
     branches:
       - main # Or your primary branch name
@@ -24,19 +29,16 @@ jobs:
       run: flutter pub get
 
     - name: Build unsigned .app bundle
-      # This command builds the app but does not sign it or create an IPA
       run: flutter build ios --release --no-codesign
 
     - name: Package the unsigned .ipa
-      # These steps manually create the IPA structure
       run: |
         mkdir -p Payload
         mv build/ios/iphoneos/Runner.app Payload/Runner.app
         zip -r -y file_share.ipa Payload
 
     - name: Upload Unsigned IPA artifact
-      # --- THIS IS THE FIX ---
-      uses: actions/upload-artifact@v4 # Use the latest version
+      uses: actions/upload-artifact@v4
       with:
         name: unsigned-ipa
         path: file_share.ipa
