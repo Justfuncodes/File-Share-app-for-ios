@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -14,13 +15,119 @@ import 'package:wechat_assets_picker/wechat_assets_picker.dart';
 
 const int port = 12345;
 
+// Models for communication between isolates
+class IsolateCommand {
+  final String ip;
+  final int code;
+  final String destinationFolder;
+  final SendPort replyPort;
+  IsolateCommand(this.ip, this.code, this.destinationFolder, this.replyPort);
+}
+
+abstract class IsolateStatus {}
+class ProgressUpdate extends IsolateStatus {
+  final double progress;
+  final String speed;
+  ProgressUpdate(this.progress, this.speed);
+}
+class StatusUpdate extends IsolateStatus {
+  final String message;
+  StatusUpdate(this.message);
+}
+class TransferError extends IsolateStatus {
+  final String error;
+  TransferError(this.error);
+}
+class TransferComplete extends IsolateStatus {}
+
+// Isolate entrypoint for high-speed receiving
+void receiverIsolate(IsolateCommand command) async {
+  Socket? socket;
+  try {
+    socket = await Socket.connect(command.ip, port, timeout: Duration(seconds: 15));
+    socket.add(Uint8List(4)..buffer.asByteData().setInt32(0, command.code));
+    await socket.flush();
+
+    var dataStream = socket.asBroadcastStream();
+
+    Future<Uint8List> readBytes(int count) async {
+      final completer = Completer<Uint8List>();
+      final buffer = BytesBuilder();
+      late StreamSubscription subscription;
+      subscription = dataStream.listen((data) {
+        buffer.add(data);
+        if (buffer.length >= count) {
+          subscription.cancel();
+          completer.complete(Uint8List.fromList(buffer.toBytes().sublist(0, count)));
+        }
+      }, onDone: () {
+        if (!completer.isCompleted) completer.completeError("Socket closed prematurely.");
+      }, onError: (e) {
+         if (!completer.isCompleted) completer.completeError(e);
+      });
+      return completer.future.timeout(const Duration(seconds: 45));
+    }
+
+    final fileCountBytes = await readBytes(4);
+    final fileCount = fileCountBytes.buffer.asByteData().getInt32(0);
+
+    for (int i = 0; i < fileCount; i++) {
+      final fileNameLenBytes = await readBytes(2);
+      final fileNameLen = fileNameLenBytes.buffer.asByteData().getInt16(0);
+      final fileNameBytes = await readBytes(fileNameLen);
+      final fileName = String.fromCharCodes(fileNameBytes);
+      final fileSizeBytes = await readBytes(8);
+      final fileSize = fileSizeBytes.buffer.asByteData().getInt64(0);
+
+      command.replyPort.send(StatusUpdate("Receiving ${i + 1}/$fileCount:\n$fileName"));
+      final outputFile = File(path.join(command.destinationFolder, fileName));
+      var sink = outputFile.openWrite();
+
+      int receivedSize = 0;
+      var stopwatch = Stopwatch()..start();
+      final completer = Completer<void>();
+      late StreamSubscription fileSubscription;
+
+      fileSubscription = dataStream.listen((data) {
+        sink.add(data);
+        receivedSize += data.length;
+        if (stopwatch.elapsedMilliseconds > 250) {
+          final speed = receivedSize / (stopwatch.elapsedMilliseconds / 1000.0) / 1024 / 1024;
+          command.replyPort.send(ProgressUpdate(
+            receivedSize / fileSize, "${speed.toStringAsFixed(1)} MB/s"
+          ));
+        }
+        if (receivedSize >= fileSize) {
+          fileSubscription.cancel();
+          completer.complete();
+        }
+      }, onDone: () {
+        if (!completer.isCompleted) completer.completeError("Socket closed before file was complete.");
+      }, onError: (e) {
+        if (!completer.isCompleted) completer.completeError(e);
+      });
+
+      await completer.future.timeout(const Duration(minutes: 60));
+      await sink.flush();
+      await sink.close();
+    }
+    socket.add([1]);
+    await socket.flush();
+    command.replyPort.send(TransferComplete());
+  } catch (e) {
+    command.replyPort.send(TransferError(e.toString()));
+  } finally {
+    socket?.destroy();
+  }
+}
+
 void main() {
   runApp(const FileShareApp());
 }
 
+// Your UI and sender logic, unchanged
 class FileShareApp extends StatelessWidget {
   const FileShareApp({super.key});
-
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -38,9 +145,7 @@ class FileShareApp extends StatelessWidget {
             backgroundColor: const Color(0xFFC4B5FD),
             foregroundColor: Colors.black,
             minimumSize: const Size.fromHeight(50),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(8),
-            ),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
           ),
         ),
       ),
@@ -49,14 +154,13 @@ class FileShareApp extends StatelessWidget {
   }
 }
 
+enum TransferState { idle, transferring, success }
+
 class MainPage extends StatefulWidget {
   const MainPage({super.key});
-
   @override
   State<MainPage> createState() => _MainPageState();
 }
-
-enum TransferState { idle, transferring, success }
 
 class _MainPageState extends State<MainPage> {
   TransferState _currentState = TransferState.idle;
@@ -65,6 +169,7 @@ class _MainPageState extends State<MainPage> {
   double _progress = 0.0;
   String _speedText = "";
   ServerSocket? _serverSocket;
+  ReceivePort? _receivePort;
 
   @override
   void initState() {
@@ -75,10 +180,12 @@ class _MainPageState extends State<MainPage> {
   @override
   void dispose() {
     _serverSocket?.close();
+    _receivePort?.close();
     super.dispose();
   }
 
   Future<void> _setIdleUI() async {
+    _receivePort?.close();
     await [Permission.photos, Permission.storage].request();
     try {
       _localIp = await NetworkInfo().getWifiIP() ?? "No Wi-Fi IP";
@@ -116,7 +223,6 @@ class _MainPageState extends State<MainPage> {
       pickerConfig: const AssetPickerConfig(maxAssets: 100, requestType: RequestType.common),
     );
     if (result == null || result.isEmpty) return;
-
     List<PlatformFile> files = [];
     for (var asset in result) {
       final file = await asset.originFile;
@@ -140,7 +246,6 @@ class _MainPageState extends State<MainPage> {
       final securityCode = Random().nextInt(899999) + 100000;
       _serverSocket = await ServerSocket.bind(InternetAddress.anyIPv4, port);
       _setTransferUI("On the other device, enter:\nIP: $_localIp\nCode: $securityCode");
-      
       await for (var clientSocket in _serverSocket!) {
         await _handleClient(clientSocket, files, securityCode);
         break;
@@ -171,7 +276,6 @@ class _MainPageState extends State<MainPage> {
       for (int i = 0; i < files.length; i++) {
         final file = files[i];
         if (mounted) setState(() => _statusText = "Sending ${i + 1}/${files.length}:\n${file.name}");
-
         final fileNameBytes = file.name.codeUnits;
         client.add(Uint8List(2)..buffer.asByteData().setInt16(0, fileNameBytes.length));
         await client.flush();
@@ -183,6 +287,7 @@ class _MainPageState extends State<MainPage> {
         final fileStream = File(file.path!).openRead();
         await client.addStream(fileStream);
       }
+      await client.first.timeout(const Duration(seconds: 60));
       await _showSuccessState("Transfer Complete!");
     } catch (e) {
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Connection Error: ${e.toString()}")));
@@ -196,7 +301,6 @@ class _MainPageState extends State<MainPage> {
     try {
       final String? result = await _showIpCodePrompt();
       if (result == null || !result.contains(':')) return;
-
       final destinationDir = await getApplicationDocumentsDirectory();
       final parts = result.split(':');
       if (parts.length != 2) throw const FormatException("Invalid format. Use IP:Code");
@@ -206,109 +310,34 @@ class _MainPageState extends State<MainPage> {
       if (code == null) throw const FormatException("Invalid code.");
 
       _setTransferUI("Connecting to $ip...");
-      await _startReceiver(ip, code, destinationDir.path);
-      await _showSuccessState("All files saved to Files app!");
+      _receivePort = ReceivePort();
+      final command = IsolateCommand(ip, code, destinationDir.path, _receivePort!.sendPort);
+      await Isolate.spawn(receiverIsolate, command);
+
+      _receivePort!.listen((message) {
+        if (message is ProgressUpdate) {
+          if (mounted) setState(() {
+            _progress = message.progress;
+            _speedText = message.speed;
+          });
+        } else if (message is StatusUpdate) {
+          if (mounted) setState(() => _statusText = message.message);
+        } else if (message is TransferError) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Receive Error: ${message.error}")));
+            _setIdleUI();
+          }
+        } else if (message is TransferComplete) {
+          if (mounted) {
+            _showSuccessState("All files saved to Files app!");
+          }
+        }
+      });
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Receive Error: ${e.toString()}")));
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Error: ${e.toString()}")));
         await _setIdleUI();
       }
-    }
-  }
-
-  Future<void> _startReceiver(String ip, int code, String destinationFolder) async {
-    Socket? socket;
-    try {
-      socket = await Socket.connect(ip, port, timeout: const Duration(seconds: 15));
-      socket.add(Uint8List(4)..buffer.asByteData().setInt32(0, code));
-      await socket.flush();
-
-      var dataStream = socket.asBroadcastStream();
-      
-      Future<Uint8List> readBytes(int count) async {
-        final completer = Completer<Uint8List>();
-        final buffer = BytesBuilder();
-        late StreamSubscription subscription;
-        subscription = dataStream.listen(
-          (data) {
-            buffer.add(data);
-            if (buffer.length >= count) {
-              subscription.cancel();
-              completer.complete(Uint8List.fromList(buffer.toBytes().sublist(0, count)));
-            }
-          },
-          onDone: () {
-            if (!completer.isCompleted) completer.completeError("Socket closed prematurely.");
-          },
-          onError: (e) {
-             if (!completer.isCompleted) completer.completeError(e);
-          }
-        );
-        return await completer.future.timeout(const Duration(seconds: 30));
-      }
-
-      final fileCountBytes = await readBytes(4);
-      final fileCount = fileCountBytes.buffer.asByteData().getInt32(0);
-
-      for (int i = 0; i < fileCount; i++) {
-        final fileNameLenBytes = await readBytes(2);
-        final fileNameLen = fileNameLenBytes.buffer.asByteData().getInt16(0);
-        final fileNameBytes = await readBytes(fileNameLen);
-        final fileName = String.fromCharCodes(fileNameBytes);
-        
-        final fileSizebytes = await readBytes(8);
-        final fileSize = fileSizebytes.buffer.asByteData().getInt64(0);
-
-        if (mounted) {
-          setState(() {
-            _statusText = "Receiving ${i + 1}/$fileCount:\n$fileName";
-            _progress = 0;
-            _speedText = "0 MB/s";
-          });
-        }
-        
-        final outputFile = File(path.join(destinationFolder, fileName));
-        var sink = outputFile.openWrite();
-        
-        int receivedSize = 0;
-        var stopwatch = Stopwatch()..start();
-        
-        final completer = Completer<void>();
-        late StreamSubscription subscription;
-        subscription = dataStream.listen(
-          (data) {
-            sink.add(data);
-            receivedSize += data.length;
-            
-            if (stopwatch.elapsedMilliseconds > 500) {
-              final speed = receivedSize / (stopwatch.elapsedMilliseconds / 1000.0) / 1024 / 1024;
-              if (mounted) {
-                setState(() {
-                  _progress = receivedSize / fileSize;
-                  _speedText = "${speed.toStringAsFixed(2)} MB/s";
-                });
-              }
-            }
-
-            if (receivedSize >= fileSize) {
-              subscription.cancel();
-              completer.complete();
-            }
-          },
-          onDone: () {
-             if (!completer.isCompleted) completer.completeError("Socket closed before file was complete.");
-          },
-          onError: (e) {
-             if (!completer.isCompleted) completer.completeError(e);
-          }
-        );
-
-        await completer.future.timeout(const Duration(minutes: 30));
-        await sink.flush();
-        await sink.close();
-      }
-    } finally {
-      socket?.destroy();
     }
   }
 
@@ -374,7 +403,6 @@ class _MainPageState extends State<MainPage> {
     );
   }
 
-  // --- THIS IS THE MISSING METHOD ---
   Widget _buildContent() {
     final textStyle = const TextStyle(color: Colors.black, fontSize: 18, fontWeight: FontWeight.w600);
     switch (_currentState) {
