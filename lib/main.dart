@@ -40,7 +40,7 @@ class TransferError extends IsolateStatus {
 }
 class TransferComplete extends IsolateStatus {}
 
-// --- Isolate Entry Point (with corruption fix) ---
+// --- Isolate Entry Point (Receiver) ---
 void receiverIsolate(IsolateCommand command) async {
   Socket? socket;
   try {
@@ -49,78 +49,79 @@ void receiverIsolate(IsolateCommand command) async {
     await socket.flush();
 
     final buffer = BytesBuilder();
-    final stream = socket.asBroadcastStream();
-    
-    // Unified data reader
-    Future<Uint8List> readBytes(int count) async {
-        // If buffer already has enough data, return it immediately
-        if (buffer.length >= count) {
-            final data = buffer.toBytes().sublist(0, count);
-            final remaining = buffer.toBytes().sublist(count);
-            buffer.clear();
-            buffer.add(remaining);
-            return Uint8List.fromList(data);
-        }
-        
-        // Wait for more data from the stream
-        final completer = Completer<Uint8List>();
-        late StreamSubscription subscription;
-        subscription = stream.listen((data) {
-            buffer.add(data);
-            if (buffer.length >= count) {
-                subscription.cancel();
-                final bytes = buffer.toBytes().sublist(0, count);
-                final remaining = buffer.toBytes().sublist(count);
-                buffer.clear();
-                buffer.add(remaining);
-                completer.complete(Uint8List.fromList(bytes));
-            }
-        }, onDone: () {
-            if (!completer.isCompleted) completer.completeError("Socket closed while waiting for data.");
-        }, onError: (e) {
-            if (!completer.isCompleted) completer.completeError(e);
-        });
+    Completer<void>? dataAvailable;
 
-        return completer.future.timeout(const Duration(seconds: 45));
+    final streamSubscription = socket.listen(
+      (data) {
+        buffer.add(data);
+        if (dataAvailable != null && !dataAvailable!.isCompleted) {
+          dataAvailable!.complete();
+        }
+      },
+      onError: (error) {
+        command.replyPort.send(TransferError(error.toString()));
+      },
+      onDone: () {
+        if (dataAvailable != null && !dataAvailable!.isCompleted) {
+          dataAvailable!.completeError("Socket closed unexpectedly.");
+        }
+      },
+      cancelOnError: true,
+    );
+
+    Future<Uint8List> readBytes(int count) async {
+      while (buffer.length < count) {
+        dataAvailable = Completer<void>();
+        await dataAvailable!.future.timeout(const Duration(seconds: 45));
+      }
+      final bytes = buffer.toBytes().sublist(0, count);
+      final remaining = buffer.toBytes().sublist(count);
+      buffer.clear();
+      buffer.add(remaining);
+      return Uint8List.fromList(bytes);
     }
 
     final fileCountBytes = await readBytes(4);
     final fileCount = fileCountBytes.buffer.asByteData().getInt32(0);
 
     for (int i = 0; i < fileCount; i++) {
-        final fileNameLenBytes = await readBytes(2);
-        final fileNameLen = fileNameLenBytes.buffer.asByteData().getInt16(0);
-        final fileNameBytes = await readBytes(fileNameLen);
-        final fileName = String.fromCharCodes(fileNameBytes);
-        final fileSizebytes = await readBytes(8);
-        final fileSize = fileSizebytes.buffer.asByteData().getInt64(0);
+      final fileNameLenBytes = await readBytes(2);
+      final fileNameLen = fileNameLenBytes.buffer.asByteData().getInt16(0);
+      final fileNameBytes = await readBytes(fileNameLen);
+      final fileName = String.fromCharCodes(fileNameBytes);
+      final fileSizebytes = await readBytes(8);
+      final fileSize = fileSizebytes.buffer.asByteData().getInt64(0);
 
-        command.replyPort.send(StatusUpdate("Receiving ${i + 1}/$fileCount:\n$fileName"));
+      command.replyPort.send(StatusUpdate("Receiving ${i + 1}/$fileCount:\n$fileName"));
       
-        final outputFile = File(path.join(command.destinationFolder, fileName));
-        var sink = outputFile.openWrite();
+      final outputFile = File(path.join(command.destinationFolder, fileName));
+      var sink = outputFile.openWrite();
       
-        int receivedSize = 0;
-        var stopwatch = Stopwatch()..start();
+      int receivedSize = 0;
+      var stopwatch = Stopwatch()..start();
 
-        while(receivedSize < fileSize) {
-            final chunkSize = min(fileSize - receivedSize, 65536);
-            final chunk = await readBytes(chunkSize);
-            sink.add(chunk);
-            receivedSize += chunk.length;
+      while (receivedSize < fileSize) {
+        final toRead = min(fileSize - receivedSize, 65536);
+        final chunk = await readBytes(toRead);
+        sink.add(chunk);
+        receivedSize += chunk.length;
 
-            if (stopwatch.elapsedMilliseconds > 250) {
-                final speed = receivedSize / (stopwatch.elapsedMilliseconds / 1000.0) / 1024 / 1024;
-                command.replyPort.send(ProgressUpdate(receivedSize / fileSize, "${speed.toStringAsFixed(1)} MB/s"));
-            }
+        if (stopwatch.elapsedMilliseconds > 300) {
+            final speed = (receivedSize / stopwatch.elapsed.inMilliseconds) * 1000 / (1024 * 1024);
+            command.replyPort.send(ProgressUpdate(receivedSize / fileSize, "${speed.toStringAsFixed(1)} MB/s"));
         }
-        
-        await sink.flush();
-        await sink.close();
+      }
+      
+      await sink.flush();
+      await sink.close();
     }
+
     socket.add([1]);
     await socket.flush();
     command.replyPort.send(TransferComplete());
+    
+    await streamSubscription.cancel();
+
   } catch (e) {
     command.replyPort.send(TransferError(e.toString()));
   } finally {
@@ -128,8 +129,7 @@ void receiverIsolate(IsolateCommand command) async {
   }
 }
 
-
-// --- Main App Code (remains the same) ---
+// --- Main App Code ---
 void main() {
   runApp(const FileShareApp());
 }
@@ -267,6 +267,7 @@ class _MainPageState extends State<MainPage> {
     }
   }
 
+  // --- SENDER LOGIC (with speed display) ---
   Future<void> _handleClient(Socket client, List<PlatformFile> files, int securityCode) async {
     try {
       var completer = Completer<Uint8List>();
@@ -281,9 +282,12 @@ class _MainPageState extends State<MainPage> {
       client.add(Uint8List(4)..buffer.asByteData().setInt32(0, files.length));
       await client.flush();
 
+      final totalSize = files.fold<int>(0, (sum, file) => sum + file.size);
+      int totalBytesSent = 0;
+
       for (int i = 0; i < files.length; i++) {
         final file = files[i];
-        if (mounted) setState(() => _statusText = "Sending ${i + 1}/${files.length}:\n${file.name}");
+        
         final fileNameBytes = file.name.codeUnits;
         client.add(Uint8List(2)..buffer.asByteData().setInt16(0, fileNameBytes.length));
         await client.flush();
@@ -292,11 +296,28 @@ class _MainPageState extends State<MainPage> {
         client.add(Uint8List(8)..buffer.asByteData().setInt64(0, file.size));
         await client.flush();
 
+        var stopwatch = Stopwatch()..start();
         final fileStream = File(file.path!).openRead();
-        await client.addStream(fileStream);
+
+        await for (final chunk in fileStream) {
+            client.add(chunk);
+            totalBytesSent += chunk.length;
+
+            if(stopwatch.elapsedMilliseconds > 250){
+                final speed = (totalBytesSent / stopwatch.elapsed.inMilliseconds) * 1000 / (1024*1024);
+                if (mounted) setState(() {
+                    _statusText = "Sending ${i + 1}/${files.length}:\n${file.name}";
+                    _progress = totalBytesSent / totalSize;
+                    _speedText = "${speed.toStringAsFixed(1)} MB/s";
+                });
+            }
+        }
+        await client.flush(); // Ensure last chunk is sent
       }
+
       await client.first.timeout(const Duration(seconds: 60));
       await _showSuccessState("Transfer Complete!");
+
     } catch (e) {
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Connection Error: ${e.toString()}")));
       await _setIdleUI();
@@ -441,4 +462,3 @@ class _MainPageState extends State<MainPage> {
     }
   }
 }
-
