@@ -1,14 +1,10 @@
 name: Build Unsigned Flutter iOS App
 
 on:
-  # --- THIS IS THE NEW PART ---
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
-
-  # This part was already here
   push:
     branches:
-      - main # Or your primary branch name
+      - main
 
 jobs:
   build:
@@ -21,7 +17,9 @@ jobs:
     - name: Set up Flutter
       uses: subosito/flutter-action@v2
       with:
-        flutter-version: '3.19.0' # Use a specific, stable Flutter version
+        # --- THIS IS THE FIX ---
+        # Force the runner to use the new Flutter version
+        flutter-version: '3.35.4' 
         channel: 'stable'
         cache: true
 
