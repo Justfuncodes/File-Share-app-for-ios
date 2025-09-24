@@ -50,13 +50,11 @@ class IsolateComplete extends IsolateStatus {}
 
 // --- ISOLATE ENTRY POINTS ---
 
-// High-performance sender isolate
 void senderIsolate(SenderCommand command) async {
   ServerSocket? serverSocket;
   try {
     serverSocket = await ServerSocket.bind(InternetAddress.anyIPv4, port);
-    command.replyPort.send(ProgressUpdate(0, "", "Waiting for receiver..."));
-
+    
     await for (var client in serverSocket) {
       try {
         var completer = Completer<Uint8List>();
@@ -77,9 +75,9 @@ void senderIsolate(SenderCommand command) async {
         for (var file in command.files) {
           totalFilesSize += await file.length();
         }
+        if (totalFilesSize == 0) totalFilesSize = 1; // Avoid division by zero
 
         int totalBytesSent = 0;
-        var stopwatch = Stopwatch()..start();
 
         for (int i = 0; i < command.files.length; i++) {
           final file = command.files[i];
@@ -88,12 +86,11 @@ void senderIsolate(SenderCommand command) async {
           
           final fileNameBytes = fileName.codeUnits;
           client.add(Uint8List(2)..buffer.asByteData().setInt16(0, fileNameBytes.length));
-          await client.flush();
           client.add(fileNameBytes);
-          await client.flush();
           client.add(Uint8List(8)..buffer.asByteData().setInt64(0, fileSize));
           await client.flush();
 
+          var stopwatch = Stopwatch()..start();
           final fileStream = file.openRead();
 
           await for (final chunk in fileStream) {
@@ -119,7 +116,7 @@ void senderIsolate(SenderCommand command) async {
         command.replyPort.send(IsolateError(e.toString()));
       } finally {
         client.close();
-        break; // Handle one client and finish
+        break; 
       }
     }
   } catch (e) {
@@ -129,7 +126,6 @@ void senderIsolate(SenderCommand command) async {
   }
 }
 
-// High-performance receiver isolate
 void receiverIsolate(ReceiverCommand command) async {
   Socket? socket;
   try {
@@ -166,11 +162,7 @@ void receiverIsolate(ReceiverCommand command) async {
 
     final fileCountBytes = await readBytes(4);
     final fileCount = fileCountBytes.buffer.asByteData().getInt32(0);
-    int totalReceivedSize = 0;
-    
-    // Pre-calculate total size for overall progress (optional but good for UX)
-    // This part is a simplification. A real implementation might send total size first.
-    
+
     for (int i = 0; i < fileCount; i++) {
       final fileNameLenBytes = await readBytes(2);
       final fileNameLen = fileNameLenBytes.buffer.asByteData().getInt16(0);
@@ -179,7 +171,7 @@ void receiverIsolate(ReceiverCommand command) async {
       final fileSizebytes = await readBytes(8);
       final fileSize = fileSizebytes.buffer.asByteData().getInt64(0);
 
-      command.replyPort.send(ProgressUpdate(totalReceivedSize / 1, "", "Receiving ${i + 1}/$fileCount:\n$fileName"));
+      command.replyPort.send(ProgressUpdate(0, "", "Receiving ${i + 1}/$fileCount:\n$fileName"));
       
       final outputFile = File(path.join(command.destinationFolder, fileName));
       var sink = outputFile.openWrite();
@@ -195,10 +187,9 @@ void receiverIsolate(ReceiverCommand command) async {
 
         if (stopwatch.elapsedMilliseconds > 300) {
             final speed = receivedInFile / (stopwatch.elapsed.inMilliseconds / 1000.0) / (1024 * 1024);
-            command.replyPort.send(ProgressUpdate((totalReceivedSize + receivedInFile) / 1, "${speed.toStringAsFixed(1)} MB/s", "Receiving ${i + 1}/$fileCount:\n$fileName"));
+            command.replyPort.send(ProgressUpdate(receivedInFile / fileSize, "${speed.toStringAsFixed(1)} MB/s", "Receiving ${i + 1}/$fileCount:\n$fileName"));
         }
       }
-      totalReceivedSize += fileSize;
       await sink.flush();
       await sink.close();
     }
@@ -348,20 +339,24 @@ class _MainPageState extends State<MainPage> {
     _killIsolate();
     setState(() {
       _currentState = TransferState.transferring;
-      _statusText = "${files.length} file(s) ready to send.";
+      _statusText = "Preparing to send...";
       _progress = 0.0;
       _speedText = "";
     });
 
     try {
       final securityCode = Random().nextInt(899999) + 100000;
+      
+      // *** THE FIX IS HERE: Update UI *before* spawning the isolate. ***
+      setState(() {
+        _statusText = "On the other device, enter:\nIP: $_localIp\nCode: $securityCode";
+      });
+
       _receivePort = ReceivePort();
       final command = SenderCommand(_receivePort!.sendPort, files, securityCode);
       _isolate = await Isolate.spawn(senderIsolate, command);
       _listenToIsolate();
-       setState(() {
-        _statusText = "On the other device, enter:\nIP: $_localIp\nCode: $securityCode";
-      });
+      
     } catch (e) {
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Send Error: ${e.toString()}")));
       await _setIdleUI();
