@@ -14,6 +14,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:wechat_assets_picker/wechat_assets_picker.dart';
 
 const int port = 12345;
+const int chunkSize = 1024 * 1024; // 1MB chunks for optimal speed
 
 // --- Data Models for Isolate Communication ---
 class IsolateCommand {
@@ -101,7 +102,7 @@ void receiverIsolate(IsolateCommand command) async {
       var stopwatch = Stopwatch()..start();
 
       while (receivedSize < fileSize) {
-        final toRead = min(fileSize - receivedSize, 65536);
+        final toRead = min(fileSize - receivedSize, chunkSize); // Use 1MB chunks
         final chunk = await readBytes(toRead);
         sink.add(chunk);
         receivedSize += chunk.length;
@@ -231,24 +232,22 @@ class _MainPageState extends State<MainPage> {
       pickerConfig: const AssetPickerConfig(maxAssets: 100, requestType: RequestType.common),
     );
     if (result == null || result.isEmpty) return;
-    List<PlatformFile> files = [];
+    List<File> files = [];
     for (var asset in result) {
-      final file = await asset.originFile;
-      if (file != null) {
-        files.add(PlatformFile(
-            name: asset.title ?? 'unknown_media', path: file.path, size: await file.length()));
-      }
+      final file = await asset.file;
+      if (file != null) files.add(file);
     }
     if (files.isNotEmpty) await _startSending(files);
   }
 
   Future<void> _pickFiles() async {
-    final result = await FilePicker.platform.pickFiles(allowMultiple: true);
+    final result = await FilePicker.platform.pickFiles(allowMultiple: true, withData: false, withReadStream: true);
     if (result == null || result.files.isEmpty) return;
-    await _startSending(result.files);
+    List<File> files = result.paths.where((path) => path != null).map((path) => File(path!)).toList();
+    if (files.isNotEmpty) await _startSending(files);
   }
 
-  Future<void> _startSending(List<PlatformFile> files) async {
+  Future<void> _startSending(List<File> files) async {
     _setTransferUI("${files.length} file(s) ready to send.");
     try {
       final securityCode = Random().nextInt(899999) + 100000;
@@ -267,8 +266,8 @@ class _MainPageState extends State<MainPage> {
     }
   }
 
-  // --- SENDER LOGIC (with speed display) ---
-  Future<void> _handleClient(Socket client, List<PlatformFile> files, int securityCode) async {
+  // --- SENDER LOGIC (with 1MB chunks) ---
+  Future<void> _handleClient(Socket client, List<File> files, int securityCode) async {
     try {
       var completer = Completer<Uint8List>();
       var subscription = client.listen((data) {
@@ -281,23 +280,29 @@ class _MainPageState extends State<MainPage> {
 
       client.add(Uint8List(4)..buffer.asByteData().setInt32(0, files.length));
       await client.flush();
+      
+      int totalFilesSize = 0;
+      for(var file in files){
+        totalFilesSize += await file.length();
+      }
 
-      final totalSize = files.fold<int>(0, (sum, file) => sum + file.size);
       int totalBytesSent = 0;
+      var stopwatch = Stopwatch()..start();
 
       for (int i = 0; i < files.length; i++) {
         final file = files[i];
+        final fileSize = await file.length();
+        final fileName = path.basename(file.path);
         
-        final fileNameBytes = file.name.codeUnits;
+        final fileNameBytes = fileName.codeUnits;
         client.add(Uint8List(2)..buffer.asByteData().setInt16(0, fileNameBytes.length));
         await client.flush();
         client.add(fileNameBytes);
         await client.flush();
-        client.add(Uint8List(8)..buffer.asByteData().setInt64(0, file.size));
+        client.add(Uint8List(8)..buffer.asByteData().setInt64(0, fileSize));
         await client.flush();
 
-        var stopwatch = Stopwatch()..start();
-        final fileStream = File(file.path!).openRead();
+        final fileStream = file.openRead();
 
         await for (final chunk in fileStream) {
             client.add(chunk);
@@ -306,13 +311,13 @@ class _MainPageState extends State<MainPage> {
             if(stopwatch.elapsedMilliseconds > 250){
                 final speed = (totalBytesSent / stopwatch.elapsed.inMilliseconds) * 1000 / (1024*1024);
                 if (mounted) setState(() {
-                    _statusText = "Sending ${i + 1}/${files.length}:\n${file.name}";
-                    _progress = totalBytesSent / totalSize;
+                    _statusText = "Sending ${i + 1}/${files.length}:\n$fileName";
+                    _progress = totalBytesSent / totalFilesSize;
                     _speedText = "${speed.toStringAsFixed(1)} MB/s";
                 });
             }
         }
-        await client.flush(); // Ensure last chunk is sent
+        await client.flush();
       }
 
       await client.first.timeout(const Duration(seconds: 60));
