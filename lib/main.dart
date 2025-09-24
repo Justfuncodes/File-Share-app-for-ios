@@ -10,6 +10,7 @@ import 'package:network_info_plus/network_info_plus.dart';
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:wechat_assets_picker/wechat_assets_picker.dart';
 
 // Constants
 const int port = 12345;
@@ -114,68 +115,88 @@ class _MainPageState extends State<MainPage> {
   }
 
   // --- Networking Logic (Sender) ---
-  Future<void> _sendButton_Clicked() async {
-    final result = await FilePicker.platform.pickFiles(allowMultiple: true);
-    if (result == null || result.files.isEmpty) return;
+  // --- REPLACE the old _sendButton_Clicked function ---
+Future<void> _sendButton_Clicked() async {
+  final List<AssetEntity>? result = await AssetPicker.pickAssets(
+    context,
+    pickerConfig: const AssetPickerConfig(
+      maxAssets: 100, // Allow up to 100 files at once
+      requestType: RequestType.common, // Show photos, videos, and other files
+    ),
+  );
 
-    _filesToSend = result.files;
-    _setTransferUI("${_filesToSend.length} file(s) ready to send.");
-    
-    try {
-      final securityCode = Random().nextInt(899999) + 100000;
-      _serverSocket = await ServerSocket.bind(InternetAddress.anyIPv4, port);
-      _setTransferUI("On the other device, enter:\nIP: $_localIp\nCode: $securityCode");
-      
-      await for (var clientSocket in _serverSocket!) {
-        await _handleClient(clientSocket, _filesToSend, securityCode);
-        break;
-      }
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Send Error: ${e.toString()}")));
-      await _setIdleUI();
-    } finally {
-      await _serverSocket?.close();
-      _serverSocket = null;
+  if (result == null || result.isEmpty) return;
+
+  _filesToSend.clear();
+  for (var asset in result) {
+    final file = await asset.originFile;
+    if (file != null) {
+      _filesToSend.add(PlatformFile(
+        name: asset.title ?? 'unknown',
+        path: file.path,
+        size: await file.length(),
+      ));
     }
   }
+  
+  if (_filesToSend.isEmpty) return;
+
+  _setTransferUI("${_filesToSend.length} file(s) ready to send.");
+  
+  try {
+    final securityCode = Random().nextInt(899999) + 100000;
+    _serverSocket = await ServerSocket.bind(InternetAddress.anyIPv4, port);
+    _setTransferUI("On the other device, enter:\nIP: $_localIp\nCode: $securityCode");
+    
+    await for (var clientSocket in _serverSocket!) {
+      await _handleClient(clientSocket, _filesToSend, securityCode);
+      break;
+    }
+  } catch (e) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Send Error: ${e.toString()}")));
+    await _setIdleUI();
+  } finally {
+    await _serverSocket?.close();
+    _serverSocket = null;
+  }
+}
+
 
   // --- REPLACE THE OLD _handleClient with this NEW version ---
+// --- REPLACE the old _handleClient function ---
 Future<void> _handleClient(Socket client, List<PlatformFile> files, int securityCode) async {
   try {
-    // This part is the same: check the security code
     var completer = Completer<Uint8List>();
     var subscription = client.listen(
       (data) {
         if (!completer.isCompleted) completer.complete(data);
       }
     );
+    
     final receivedData = await completer.future;
     subscription.cancel();
     final receivedCode = receivedData.buffer.asByteData().getInt32(0);
     if (receivedCode != securityCode) throw Exception("Wrong security code.");
 
-    // Send file count
     client.add(Uint8List(4)..buffer.asByteData().setInt32(0, files.length));
-    
-    // Loop through and stream each file
+    await client.flush(); // Flush after sending file count
+
     for (int i = 0; i < files.length; i++) {
       final file = files[i];
       if (mounted) setState(() => _statusText = "Sending ${i + 1}/${files.length}:\n${file.name}");
 
-      // Send metadata
       final fileNameBytes = file.name.codeUnits;
       client.add(Uint8List(2)..buffer.asByteData().setInt16(0, fileNameBytes.length));
+      await client.flush(); // Flush
       client.add(fileNameBytes);
+      await client.flush(); // Flush
       client.add(Uint8List(8)..buffer.asByteData().setInt64(0, file.size));
+      await client.flush(); // Flush
 
-      // --- THIS IS THE PERFORMANCE FIX ---
-      // Open the file as a stream and pipe it directly to the socket.
-      // This sends the file in chunks without loading it all into memory.
       final fileStream = File(file.path!).openRead();
-      await client.addStream(fileStream);
+      await client.addStream(fileStream); // addStream handles its own flushing
     }
-
     await _showSuccessState("Transfer Complete!");
   } catch (e) {
       if (!mounted) return;
