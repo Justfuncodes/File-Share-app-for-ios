@@ -1,0 +1,41 @@
+name: Build Unsigned Flutter iOS App
+
+on:
+  push:
+    branches:
+      - main # Or your primary branch name
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Set up Flutter
+      uses: subosito/flutter-action@v2
+      with:
+        flutter-version: '3.19.0' # Use a specific, stable Flutter version
+        channel: 'stable'
+        cache: true
+
+    - name: Install dependencies
+      run: flutter pub get
+
+    - name: Build unsigned .app bundle
+      # This command builds the app but does not sign it or create an IPA
+      run: flutter build ios --release --no-codesign
+
+    - name: Package the unsigned .ipa
+      # These steps manually create the IPA structure
+      run: |
+        mkdir -p Payload
+        mv build/ios/iphoneos/Runner.app Payload/Runner.app
+        zip -r -y file_share.ipa Payload
+
+    - name: Upload Unsigned IPA artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: unsigned-ipa
+        path: file_share.ipa
