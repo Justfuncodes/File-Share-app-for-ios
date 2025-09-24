@@ -15,7 +15,7 @@ import 'package:wechat_assets_picker/wechat_assets_picker.dart';
 
 const int port = 12345;
 
-// Models for communication between isolates
+// --- Data Models for Isolate Communication ---
 class IsolateCommand {
   final String ip;
   final int code;
@@ -40,76 +40,83 @@ class TransferError extends IsolateStatus {
 }
 class TransferComplete extends IsolateStatus {}
 
-// Isolate entrypoint for high-speed receiving
+// --- Isolate Entry Point (with corruption fix) ---
 void receiverIsolate(IsolateCommand command) async {
   Socket? socket;
   try {
-    socket = await Socket.connect(command.ip, port, timeout: Duration(seconds: 15));
+    socket = await Socket.connect(command.ip, port, timeout: const Duration(seconds: 15));
     socket.add(Uint8List(4)..buffer.asByteData().setInt32(0, command.code));
     await socket.flush();
 
-    var dataStream = socket.asBroadcastStream();
-
+    final buffer = BytesBuilder();
+    final stream = socket.asBroadcastStream();
+    
+    // Unified data reader
     Future<Uint8List> readBytes(int count) async {
-      final completer = Completer<Uint8List>();
-      final buffer = BytesBuilder();
-      late StreamSubscription subscription;
-      subscription = dataStream.listen((data) {
-        buffer.add(data);
+        // If buffer already has enough data, return it immediately
         if (buffer.length >= count) {
-          subscription.cancel();
-          completer.complete(Uint8List.fromList(buffer.toBytes().sublist(0, count)));
+            final data = buffer.toBytes().sublist(0, count);
+            final remaining = buffer.toBytes().sublist(count);
+            buffer.clear();
+            buffer.add(remaining);
+            return Uint8List.fromList(data);
         }
-      }, onDone: () {
-        if (!completer.isCompleted) completer.completeError("Socket closed prematurely.");
-      }, onError: (e) {
-         if (!completer.isCompleted) completer.completeError(e);
-      });
-      return completer.future.timeout(const Duration(seconds: 45));
+        
+        // Wait for more data from the stream
+        final completer = Completer<Uint8List>();
+        late StreamSubscription subscription;
+        subscription = stream.listen((data) {
+            buffer.add(data);
+            if (buffer.length >= count) {
+                subscription.cancel();
+                final bytes = buffer.toBytes().sublist(0, count);
+                final remaining = buffer.toBytes().sublist(count);
+                buffer.clear();
+                buffer.add(remaining);
+                completer.complete(Uint8List.fromList(bytes));
+            }
+        }, onDone: () {
+            if (!completer.isCompleted) completer.completeError("Socket closed while waiting for data.");
+        }, onError: (e) {
+            if (!completer.isCompleted) completer.completeError(e);
+        });
+
+        return completer.future.timeout(const Duration(seconds: 45));
     }
 
     final fileCountBytes = await readBytes(4);
     final fileCount = fileCountBytes.buffer.asByteData().getInt32(0);
 
     for (int i = 0; i < fileCount; i++) {
-      final fileNameLenBytes = await readBytes(2);
-      final fileNameLen = fileNameLenBytes.buffer.asByteData().getInt16(0);
-      final fileNameBytes = await readBytes(fileNameLen);
-      final fileName = String.fromCharCodes(fileNameBytes);
-      final fileSizeBytes = await readBytes(8);
-      final fileSize = fileSizeBytes.buffer.asByteData().getInt64(0);
+        final fileNameLenBytes = await readBytes(2);
+        final fileNameLen = fileNameLenBytes.buffer.asByteData().getInt16(0);
+        final fileNameBytes = await readBytes(fileNameLen);
+        final fileName = String.fromCharCodes(fileNameBytes);
+        final fileSizebytes = await readBytes(8);
+        final fileSize = fileSizebytes.buffer.asByteData().getInt64(0);
 
-      command.replyPort.send(StatusUpdate("Receiving ${i + 1}/$fileCount:\n$fileName"));
-      final outputFile = File(path.join(command.destinationFolder, fileName));
-      var sink = outputFile.openWrite();
+        command.replyPort.send(StatusUpdate("Receiving ${i + 1}/$fileCount:\n$fileName"));
+      
+        final outputFile = File(path.join(command.destinationFolder, fileName));
+        var sink = outputFile.openWrite();
+      
+        int receivedSize = 0;
+        var stopwatch = Stopwatch()..start();
 
-      int receivedSize = 0;
-      var stopwatch = Stopwatch()..start();
-      final completer = Completer<void>();
-      late StreamSubscription fileSubscription;
+        while(receivedSize < fileSize) {
+            final chunkSize = min(fileSize - receivedSize, 65536);
+            final chunk = await readBytes(chunkSize);
+            sink.add(chunk);
+            receivedSize += chunk.length;
 
-      fileSubscription = dataStream.listen((data) {
-        sink.add(data);
-        receivedSize += data.length;
-        if (stopwatch.elapsedMilliseconds > 250) {
-          final speed = receivedSize / (stopwatch.elapsedMilliseconds / 1000.0) / 1024 / 1024;
-          command.replyPort.send(ProgressUpdate(
-            receivedSize / fileSize, "${speed.toStringAsFixed(1)} MB/s"
-          ));
+            if (stopwatch.elapsedMilliseconds > 250) {
+                final speed = receivedSize / (stopwatch.elapsedMilliseconds / 1000.0) / 1024 / 1024;
+                command.replyPort.send(ProgressUpdate(receivedSize / fileSize, "${speed.toStringAsFixed(1)} MB/s"));
+            }
         }
-        if (receivedSize >= fileSize) {
-          fileSubscription.cancel();
-          completer.complete();
-        }
-      }, onDone: () {
-        if (!completer.isCompleted) completer.completeError("Socket closed before file was complete.");
-      }, onError: (e) {
-        if (!completer.isCompleted) completer.completeError(e);
-      });
-
-      await completer.future.timeout(const Duration(minutes: 60));
-      await sink.flush();
-      await sink.close();
+        
+        await sink.flush();
+        await sink.close();
     }
     socket.add([1]);
     await socket.flush();
@@ -121,11 +128,12 @@ void receiverIsolate(IsolateCommand command) async {
   }
 }
 
+
+// --- Main App Code (remains the same) ---
 void main() {
   runApp(const FileShareApp());
 }
 
-// Your UI and sender logic, unchanged
 class FileShareApp extends StatelessWidget {
   const FileShareApp({super.key});
   @override
@@ -433,3 +441,4 @@ class _MainPageState extends State<MainPage> {
     }
   }
 }
+
