@@ -140,48 +140,52 @@ class _MainPageState extends State<MainPage> {
     }
   }
 
-  Future<void> _handleClient(Socket client, List<PlatformFile> files, int securityCode) async {
-    try {
-      var completer = Completer<Uint8List>();
-      var subscription = client.listen(
-        (data) {
-          if (!completer.isCompleted) completer.complete(data);
-        }
-      );
-      
-      final receivedData = await completer.future;
-      subscription.cancel();
-      final receivedCode = receivedData.buffer.asByteData().getInt32(0);
-      if (receivedCode != securityCode) throw Exception("Wrong security code.");
-
-      client.add(Uint8List(4)..buffer.asByteData().setInt32(0, files.length));
-      await client.flush();
-
-      for (int i = 0; i < files.length; i++) {
-        final file = files[i];
-        final fileBytes = File(file.path!).readAsBytesSync();
-        final fileNameBytes = file.name.codeUnits;
-
-        setState(() => _statusText = "Sending ${i + 1}/${files.length}:\n${file.name}");
-
-        client.add(Uint8List(2)..buffer.asByteData().setInt16(0, fileNameBytes.length));
-        await client.flush();
-        client.add(fileNameBytes);
-        await client.flush();
-        client.add(Uint8List(8)..buffer.asByteData().setInt64(0, fileBytes.length));
-        await client.flush();
-        client.add(fileBytes);
-        await client.flush();
+  // --- REPLACE THE OLD _handleClient with this NEW version ---
+Future<void> _handleClient(Socket client, List<PlatformFile> files, int securityCode) async {
+  try {
+    // This part is the same: check the security code
+    var completer = Completer<Uint8List>();
+    var subscription = client.listen(
+      (data) {
+        if (!completer.isCompleted) completer.complete(data);
       }
-      await _showSuccessState("Transfer Complete!");
-    } catch (e) {
-       if (!mounted) return;
-       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Handle client error: ${e.toString()}")));
-       await _setIdleUI();
-    } finally {
-       client.close();
+    );
+    final receivedData = await completer.future;
+    subscription.cancel();
+    final receivedCode = receivedData.buffer.asByteData().getInt32(0);
+    if (receivedCode != securityCode) throw Exception("Wrong security code.");
+
+    // Send file count
+    client.add(Uint8List(4)..buffer.asByteData().setInt32(0, files.length));
+    
+    // Loop through and stream each file
+    for (int i = 0; i < files.length; i++) {
+      final file = files[i];
+      if (mounted) setState(() => _statusText = "Sending ${i + 1}/${files.length}:\n${file.name}");
+
+      // Send metadata
+      final fileNameBytes = file.name.codeUnits;
+      client.add(Uint8List(2)..buffer.asByteData().setInt16(0, fileNameBytes.length));
+      client.add(fileNameBytes);
+      client.add(Uint8List(8)..buffer.asByteData().setInt64(0, file.size));
+
+      // --- THIS IS THE PERFORMANCE FIX ---
+      // Open the file as a stream and pipe it directly to the socket.
+      // This sends the file in chunks without loading it all into memory.
+      final fileStream = File(file.path!).openRead();
+      await client.addStream(fileStream);
     }
+
+    await _showSuccessState("Transfer Complete!");
+  } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Handle client error: ${e.toString()}")));
+      await _setIdleUI();
+  } finally {
+      client.close();
   }
+}
+
 
   // --- Networking Logic (Receiver) ---
   Future<void> _receiveButton_Clicked() async {
