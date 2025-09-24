@@ -35,7 +35,8 @@ jobs:
         zip -r -y file_share.ipa Payload
 
     - name: Upload Unsigned IPA artifact
-      uses: actions/upload-artifact@v3
+      # --- THIS IS THE FIX ---
+      uses: actions/upload-artifact@v4 # Use the latest version
       with:
         name: unsigned-ipa
         path: file_share.ipa
