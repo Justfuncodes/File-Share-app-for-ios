@@ -57,12 +57,15 @@ void senderIsolate(SenderCommand command) async {
     
     await for (var client in serverSocket) {
       try {
+        // *** THE FIX IS HERE: Use a broadcast stream for multiple listeners. ***
+        final clientStream = client.asBroadcastStream();
+
         var completer = Completer<Uint8List>();
-        var subscription = client.listen((data) {
+        var subscription = clientStream.listen((data) {
           if (!completer.isCompleted) completer.complete(data);
         });
         final receivedData = await completer.future.timeout(const Duration(seconds: 30));
-        subscription.cancel();
+        subscription.cancel(); // We are done with this listener
 
         if (receivedData.buffer.asByteData().getInt32(0) != command.securityCode) {
           throw Exception("Wrong security code.");
@@ -78,7 +81,6 @@ void senderIsolate(SenderCommand command) async {
         if (totalFilesSize == 0) totalFilesSize = 1;
 
         int totalBytesSent = 0;
-        var stopwatch = Stopwatch()..start();
 
         for (int i = 0; i < command.files.length; i++) {
           final file = command.files[i];
@@ -93,15 +95,14 @@ void senderIsolate(SenderCommand command) async {
 
           final fileStream = file.openRead();
           
-          // *** BACKPRESSURE IMPLEMENTATION ***
           int bytesSinceLastFlush = 0;
+          var stopwatch = Stopwatch()..start();
 
           await for (final chunk in fileStream) {
             client.add(chunk);
             totalBytesSent += chunk.length;
             bytesSinceLastFlush += chunk.length;
 
-            // Wait for the network to catch up every 4MB
             if (bytesSinceLastFlush >= 4 * chunkSize) {
                 await client.flush(); 
                 bytesSinceLastFlush = 0;
@@ -116,10 +117,11 @@ void senderIsolate(SenderCommand command) async {
               ));
             }
           }
-          await client.flush(); // Final flush for this file
+          await client.flush(); 
         }
 
-        await client.first.timeout(const Duration(seconds: 90));
+        // Listen again on the *same broadcast stream* for the final ACK.
+        await clientStream.first.timeout(const Duration(seconds: 90));
         command.replyPort.send(IsolateComplete());
 
       } catch (e) {
