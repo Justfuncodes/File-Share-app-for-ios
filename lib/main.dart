@@ -75,9 +75,10 @@ void senderIsolate(SenderCommand command) async {
         for (var file in command.files) {
           totalFilesSize += await file.length();
         }
-        if (totalFilesSize == 0) totalFilesSize = 1; // Avoid division by zero
+        if (totalFilesSize == 0) totalFilesSize = 1;
 
         int totalBytesSent = 0;
+        var stopwatch = Stopwatch()..start();
 
         for (int i = 0; i < command.files.length; i++) {
           final file = command.files[i];
@@ -90,12 +91,21 @@ void senderIsolate(SenderCommand command) async {
           client.add(Uint8List(8)..buffer.asByteData().setInt64(0, fileSize));
           await client.flush();
 
-          var stopwatch = Stopwatch()..start();
           final fileStream = file.openRead();
+          
+          // *** BACKPRESSURE IMPLEMENTATION ***
+          int bytesSinceLastFlush = 0;
 
           await for (final chunk in fileStream) {
             client.add(chunk);
             totalBytesSent += chunk.length;
+            bytesSinceLastFlush += chunk.length;
+
+            // Wait for the network to catch up every 4MB
+            if (bytesSinceLastFlush >= 4 * chunkSize) {
+                await client.flush(); 
+                bytesSinceLastFlush = 0;
+            }
 
             if (stopwatch.elapsedMilliseconds > 300) {
               final speed = totalBytesSent / (stopwatch.elapsed.inMilliseconds / 1000.0) / (1024 * 1024);
@@ -106,7 +116,7 @@ void senderIsolate(SenderCommand command) async {
               ));
             }
           }
-          await client.flush();
+          await client.flush(); // Final flush for this file
         }
 
         await client.first.timeout(const Duration(seconds: 90));
@@ -116,7 +126,7 @@ void senderIsolate(SenderCommand command) async {
         command.replyPort.send(IsolateError(e.toString()));
       } finally {
         client.close();
-        break; 
+        break;
       }
     }
   } catch (e) {
@@ -339,7 +349,6 @@ class _MainPageState extends State<MainPage> {
     _killIsolate();
     setState(() {
       _currentState = TransferState.transferring;
-      _statusText = "Preparing to send...";
       _progress = 0.0;
       _speedText = "";
     });
@@ -347,7 +356,6 @@ class _MainPageState extends State<MainPage> {
     try {
       final securityCode = Random().nextInt(899999) + 100000;
       
-      // *** THE FIX IS HERE: Update UI *before* spawning the isolate. ***
       setState(() {
         _statusText = "On the other device, enter:\nIP: $_localIp\nCode: $securityCode";
       });
