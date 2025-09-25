@@ -57,7 +57,6 @@ void senderIsolate(SenderCommand command) async {
     
     await for (var client in serverSocket) {
       try {
-        // *** THE FIX IS HERE: Use a broadcast stream for multiple listeners. ***
         final clientStream = client.asBroadcastStream();
 
         var completer = Completer<Uint8List>();
@@ -65,7 +64,7 @@ void senderIsolate(SenderCommand command) async {
           if (!completer.isCompleted) completer.complete(data);
         });
         final receivedData = await completer.future.timeout(const Duration(seconds: 30));
-        subscription.cancel(); // We are done with this listener
+        await subscription.cancel();
 
         if (receivedData.buffer.asByteData().getInt32(0) != command.securityCode) {
           throw Exception("Wrong security code.");
@@ -81,6 +80,7 @@ void senderIsolate(SenderCommand command) async {
         if (totalFilesSize == 0) totalFilesSize = 1;
 
         int totalBytesSent = 0;
+        var stopwatch = Stopwatch()..start();
 
         for (int i = 0; i < command.files.length; i++) {
           final file = command.files[i];
@@ -96,7 +96,6 @@ void senderIsolate(SenderCommand command) async {
           final fileStream = file.openRead();
           
           int bytesSinceLastFlush = 0;
-          var stopwatch = Stopwatch()..start();
 
           await for (final chunk in fileStream) {
             client.add(chunk);
@@ -120,8 +119,9 @@ void senderIsolate(SenderCommand command) async {
           await client.flush(); 
         }
 
-        // Listen again on the *same broadcast stream* for the final ACK.
-        await clientStream.first.timeout(const Duration(seconds: 90));
+        // *** THE FINAL FIX: Robustly wait for the specific ACK signal. ***
+        await clientStream.firstWhere((data) => data.isNotEmpty && data[0] == 1).timeout(const Duration(seconds: 90));
+        
         command.replyPort.send(IsolateComplete());
 
       } catch (e) {
@@ -189,7 +189,6 @@ void receiverIsolate(ReceiverCommand command) async {
       var sink = outputFile.openWrite();
       
       int receivedInFile = 0;
-      var stopwatch = Stopwatch()..start();
 
       while (receivedInFile < fileSize) {
         final toRead = min(fileSize - receivedInFile, chunkSize);
@@ -197,10 +196,7 @@ void receiverIsolate(ReceiverCommand command) async {
         sink.add(chunk);
         receivedInFile += chunk.length;
 
-        if (stopwatch.elapsedMilliseconds > 300) {
-            final speed = receivedInFile / (stopwatch.elapsed.inMilliseconds / 1000.0) / (1024 * 1024);
-            command.replyPort.send(ProgressUpdate(receivedInFile / fileSize, "${speed.toStringAsFixed(1)} MB/s", "Receiving ${i + 1}/$fileCount:\n$fileName"));
-        }
+        command.replyPort.send(ProgressUpdate(receivedInFile / fileSize, "", "Receiving ${i + 1}/$fileCount:\n$fileName"));
       }
       await sink.flush();
       await sink.close();
