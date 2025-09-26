@@ -93,7 +93,7 @@ void senderIsolate(SenderCommand command) async {
           client.add(Uint8List(8)..buffer.asByteData().setInt64(0, fileSize));
           await client.flush();
 
-          final fileStream = file.openRead();
+          final fileStream = file.openRead(0);
           
           int bytesSinceLastFlush = 0;
 
@@ -119,8 +119,31 @@ void senderIsolate(SenderCommand command) async {
           await client.flush(); 
         }
 
-        // *** THE FINAL FIX: Robustly wait for the specific ACK signal. ***
-        await clientStream.firstWhere((data) => data.isNotEmpty && data[0] == 1).timeout(const Duration(seconds: 90));
+        // *** THE FINAL FIX: A robust listener for the final ACK. ***
+        final ackCompleter = Completer<void>();
+        late StreamSubscription ackSubscription;
+        ackSubscription = clientStream.listen(
+          (data) {
+            if (data.isNotEmpty && data[0] == 1) {
+              if (!ackCompleter.isCompleted) {
+                ackCompleter.complete();
+                ackSubscription.cancel();
+              }
+            }
+          },
+          onDone: () {
+            if (!ackCompleter.isCompleted) {
+              ackCompleter.complete(); // Treat socket closure as success
+            }
+          },
+          onError: (e) {
+            if (!ackCompleter.isCompleted) {
+              ackCompleter.completeError(e);
+            }
+          },
+          cancelOnError: true,
+        );
+        await ackCompleter.future.timeout(const Duration(seconds: 90));
         
         command.replyPort.send(IsolateComplete());
 
@@ -196,7 +219,7 @@ void receiverIsolate(ReceiverCommand command) async {
         sink.add(chunk);
         receivedInFile += chunk.length;
 
-        command.replyPort.send(ProgressUpdate(receivedInFile / fileSize, "", "Receiving ${i + 1}/$fileCount:\n$fileName"));
+        command.replyPort.send(ProgressUpdate(receivedInFile / (fileSize == 0 ? 1 : fileSize), "", "Receiving ${i + 1}/$fileCount:\n$fileName"));
       }
       await sink.flush();
       await sink.close();
